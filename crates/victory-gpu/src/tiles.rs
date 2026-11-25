@@ -682,8 +682,10 @@ pub(crate) fn show_resident(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, resident
         }
         *most = first;
         *mips = count;
+        // `ResourceMinLODClamp` counts from the resource's first level, not
+        // the view's: it stays, at most the last level the view now shows.
         if *min_lod > 0.0 {
-            *min_lod = (*min_lod - shift as f32).clamp(0.0, (count - 1) as f32);
+            *min_lod = min_lod.min((first + count - 1) as f32);
         }
     };
     match desc.ViewDimension {
@@ -1529,7 +1531,8 @@ void look() {
         assert_eq!(v2d.MostDetailedMip, 3);
         // Clamped to remaining levels (11 - 3 = 8), not 12 - 3 = 9.
         assert_eq!(v2d.MipLevels, 8);
-        assert_eq!(v2d.ResourceMinLODClamp, 0.5);
+        // The clamp counts from the resource's level 0: 3.5 stays 3.5.
+        assert_eq!(v2d.ResourceMinLODClamp, 3.5);
 
         let mut srv_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -1551,7 +1554,28 @@ void look() {
         let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
         assert_eq!(varr.MostDetailedMip, 2);
         assert_eq!(varr.MipLevels, 4);
-        assert_eq!(varr.ResourceMinLODClamp, 0.0);
+        // Below the first level shown: kept, the view's range bounds it.
+        assert_eq!(varr.ResourceMinLODClamp, 1.5);
+
+        // A clamp past the last level the view shows comes down to it.
+        let mut past = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 4,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 3.0,
+                },
+            },
+            ..srv2d
+        };
+        // Levels 1 and 2 held, 3 not: the view shows 1-2, the clamp 2.0.
+        show_resident(&mut past, 0b0110, 11);
+        // SAFETY: `ViewDimension` is `TEXTURE2D`.
+        let vpast = unsafe { past.Anonymous.Texture2D };
+        assert_eq!((vpast.MostDetailedMip, vpast.MipLevels), (1, 2));
+        assert_eq!(vpast.ResourceMinLODClamp, 2.0);
 
         // A view asking for a missing range still has a valid finer mip.
         show_resident(&mut srv_arr, 1, 11);
