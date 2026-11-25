@@ -4023,4 +4023,184 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
+
+    /// A texture the title placed in its memory, taken away and mapped
+    /// again at the same address with other contents, is read anew by the
+    /// first list that uploads it. Two views that differ only in the filler
+    /// words of their description share one resource; after the memory is
+    /// unmapped and mapped again (the runtime says so both times) a third
+    /// view, with filler not seen before, finds that resource, whose
+    /// staging buffer was already uploaded and is clean. Its first list
+    /// read the old bytes and only the next one the new (#574, whose
+    /// reproducer this follows step by step).
+    #[cfg(windows)]
+    #[test]
+    fn a_placed_texture_mapped_again_is_read_anew_by_the_first_list() {
+        placed_texture_mapped_again(false);
+    }
+
+    /// As above, with the host copy held across the new mapping, as a
+    /// descriptor slot that shows the texture or a list not yet reset holds
+    /// it: the copy cannot be let go and made anew, and the first list
+    /// still reads the new bytes.
+    #[cfg(windows)]
+    #[test]
+    fn a_placed_texture_mapped_again_while_its_host_copy_is_held_is_read_anew() {
+        placed_texture_mapped_again(true);
+    }
+
+    /// The two tests above; `hold`: the host copy is held across the new
+    /// mapping.
+    #[cfg(windows)]
+    fn placed_texture_mapped_again(hold: bool) {
+        use crate::descriptor::View;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows_sys::Win32::System::Memory::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const SIZE: usize = 0x1_0000;
+        const COPY_SOURCE: u32 = 0x800;
+        let readback = {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 1024,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut made: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a readback buffer.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut made,
+                    )
+                    .unwrap();
+            }
+            made.unwrap()
+        };
+        // SAFETY: a private reservation of our own, committed whole, written
+        // only while it is committed.
+        let base = unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), SIZE, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            base.write_bytes(0x5a, SIZE);
+            base
+        };
+        let address = base as u64;
+        // A linear 4x4 RGBA8 texture of one level at `address`, with
+        // `filler` in words 1 and 13, viewed whole as a 2D texture.
+        let texture = |filler: u32| {
+            let resource = [3, filler, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 1, 0, !filler];
+            let mut view = [0u32; 16];
+            view[..5].copy_from_slice(&[28, 4, 0x1688, 0, 1]);
+            view[10] = address as u32;
+            view[11] = (address >> 32) as u32;
+            let Some(View::Shader(texture, _)) =
+                crate::descriptor::host::placed_texture(&View::Placed(false, resource, view))
+            else {
+                panic!("no resource for the placed texture");
+            };
+            texture as This
+        };
+        // A list that uploads the texture and reads it back, run to its end:
+        // the 64 bytes of its texels.
+        let read = |texture: This| {
+            let host_texture = host_resource(texture).unwrap();
+            let list = host.new_list().unwrap();
+            crate::texture::upload(&list, texture, host_texture);
+            crate::list::ensure_state(&list, texture, COPY_SOURCE);
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: unsafe { std::mem::transmute_copy(&readback) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(28),
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(host_texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            // SAFETY: an open list; both locations name live resources.
+            unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+            list.close();
+            host.execute(&[&list]);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the copy finished (execute waits); the buffer is 1024
+            // bytes, of which four rows of 16 are read.
+            unsafe {
+                readback
+                    .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 1024 }), Some(&mut mapped))
+                    .unwrap();
+                let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), 1024);
+                let texels: Vec<u8> = (0..4).flat_map(|row| bytes[row * 256..][..16].to_vec()).collect();
+                readback.Unmap(0, None);
+                texels
+            }
+        };
+        let first = texture(17);
+        assert_eq!(read(first), [0x5a; 64]);
+        let second = texture(31);
+        assert_eq!(read(second), [0x5a; 64]);
+        if std::env::var_os("VICTORY_PLACED_FILLER").is_none_or(|v| v != "1") {
+            assert_eq!(first, second, "the filler words make no second resource");
+        }
+        let held = hold.then(|| host_copy(first).unwrap());
+        // The runtime takes the memory away and maps it again, with the
+        // title's new contents.
+        {
+            let _remapping = crate::watch::title_memory_remapping();
+            // SAFETY: our own reservation, decommitted and committed again
+            // whole; written only while committed.
+            unsafe {
+                assert_ne!(VirtualFree(base.cast(), SIZE, MEM_DECOMMIT), 0);
+                crate::watch::title_memory_remapped(base as usize, SIZE);
+                assert_eq!(VirtualAlloc(base.cast(), SIZE, MEM_COMMIT, PAGE_READWRITE), base.cast());
+                crate::watch::title_memory_remapped(base as usize, SIZE);
+                base.write_bytes(0xa5, SIZE);
+            }
+        }
+        let third = texture(47);
+        assert_eq!(read(third), [0xa5; 64], "the first list after the mapping");
+        assert_eq!(read(third), [0xa5; 64], "the next list");
+        drop(held);
+        // Given back, as the runtime does it: the next reservation may be
+        // at the same address, where this resource is still found.
+        let _remapping = crate::watch::title_memory_remapping();
+        // SAFETY: our own reservation; nothing reads it in place any more.
+        unsafe { assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0) };
+        crate::watch::title_memory_remapped(base as usize, SIZE);
+    }
 }
