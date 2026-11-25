@@ -10,7 +10,7 @@
 |---|---|
 | **Progress** | Boots into the world and plays: the prison opening, the cell, corridors and common room, the counselor's office, Lucia's café flashback and the bank robbery in it. |
 | **Frame rate** | Median 5.7 fps in the world with the settings below (peaks 8.3); median 7.4 fps (peaks 10.3) with #823's programs off. RTX 5080, Ryzen 7 9800X3D. |
-| **Picture** | Textures in place (levels on demand), rooms lit (an ambient constant while ray tracing doesn't run) at about the console's brightness (mean luma within 2-4 of 255 of Series X footage in three matched shots at `VICTORY_AMBIENT=0.3`), mouths move in dialogue. |
+| **Picture** | Textures in place (levels on demand), rooms lit (an ambient constant while ray tracing doesn't run) at about the console's brightness (at `VICTORY_AMBIENT=0.3`, mean luma within 2-4 of 255 of Series X footage in three matched shots, measured in a test build of this tree with the ray-tracing pull requests merged), mouths move in dialogue. |
 | **Stability** | No crash and no device loss in nine ten-minute runs on 25 November (this build and the builds leading up to it). A freeze with the ray-tracing structure builder on (`VICTORY_BVH_BUILDER=1`, not in this build's settings) is fixed here: the write guards no longer make the process heap read-only. |
 
 Measured on one machine: RTX 5080 16 GB (driver 621.14), Ryzen 7 9800X3D (8 threads), Windows 11, Series X profile, release build. Test reports from other hardware are very welcome ([how](CONTRIBUTING.md#test-reports)).
