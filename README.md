@@ -70,12 +70,14 @@ $env:VICTORY_ASYNC_SUBMIT = '1';    $env:VICTORY_QUEUE2 = '1';     $env:VICTORY_
 $env:VICTORY_HEAP_WORKER = '1';     $env:VICTORY_LEVELS_ON_DEMAND = '1'; $env:VICTORY_AMBIENT = '0.3'
 $env:VICTORY_TEXTURE_STAGE_MB = '4096'; $env:VICTORY_TEXTURE_STAGE_MS = '8000'   # finish due textures before the frame
 $env:VICTORY_WAVE_WIDE_ONLY = '5dc3b25986622949,6f225b641c5b0708,369cbe906ea72764'   # #823 without the reflection tiling: no oily floors
+$env:VICTORY_FILL_WAIT = '1'   # constants copied for the card wait for the card's work before them, as on the console: no blurred oval in the café
 target\release\victory.exe run "<game folder>\<the title's exe>" --execute
 ```
 
 The first launch translates the title's shaders into a cache and is slow; let it run once into the world. Later launches start quickly.
 
 - **Reflection tiling back on:** leave `VICTORY_WAVE_WIDE_ONLY` unset for all four of #823's programs. Close characters keep their reflected light, but floors and walls turn oily (the reflection rays find no ray-tracing structures and return the sky).
+- **Why `VICTORY_FILL_WAIT=1`:** by default the layer copies constant data for a submission without waiting for earlier work on the card that may change it, and waits only after it catches one copy that was stale. That one stale copy comes once a run, as the café flashback starts, and a blurred oval over the middle of the picture then stays for the whole scene (6 of 7 runs without the switch, 0 of 3 with it; [victory-fork#1025](https://github.com/fxceless/victory-fork/issues/1025)). It costs about one frame per second.
 - **Faster, with a trade-off:** `$env:VICTORY_WAVE_WIDE_ONLY = 'none'` turns all four off. That's about 30 % more frames per second, but the water and particle programs are dropped as well.
 - These apply to NVIDIA and other 32-lane cards: on 64-lane cards (AMD) the four programs run in their own form and the switch has no effect. Each value has its own shader cache.
 - **Input:** XInput pads. Without one, the keyboard acts as a pad while the window has focus (WASD and IJKL for the sticks, the arrow keys for the D-pad, Enter, Backspace, X and Y for A, B, X and Y).
