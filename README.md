@@ -39,6 +39,7 @@ Base: fxceless/victory-fork `main` at `ca8829f`, with these pull requests from t
 | [#1031](https://github.com/fxceless/victory-fork/pull/1031) | Lkxex | Bounded texture queue work; views over a resident run of levels |
 | [#917](https://github.com/fxceless/victory-fork/pull/917) | UwUCammie (pass by Belobug) | A constant for the indirect light while rays don't run |
 | [#982](https://github.com/fxceless/victory-fork/pull/982) | brunofgmag | Clippy passes again on victory-gpu's warnings (CI green) |
+| [#1051](https://github.com/fxceless/victory-fork/pull/1051) | meganegga | A depth-bounds test skips hosts without shader model 6.6 |
 
 VIppy's own changes:
 

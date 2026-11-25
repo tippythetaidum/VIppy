@@ -3760,6 +3760,17 @@ impl Host {
         })
     }
 
+    /// Whether the host device is the software adapter (WARP), as on a
+    /// machine without a card (continuous integration).
+    #[cfg(test)]
+    pub(crate) fn software(&self) -> bool {
+        // SAFETY: a plain query.
+        self.adapter
+            .as_ref()
+            .and_then(|a| unsafe { a.GetDesc1() }.ok())
+            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+    }
+
     /// Whether the host GPU supports the depth bounds test; logged once.
     pub(crate) fn depth_bounds(&self) -> bool {
         static BOUNDS: OnceLock<bool> = OnceLock::new();

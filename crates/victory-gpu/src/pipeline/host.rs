@@ -1081,6 +1081,12 @@ mod tests {
             eprintln!("no host depth bounds support; skipped");
             return;
         }
+        // WARP reports the depth bounds test but lets the draw through with
+        // the depth test itself off (as below), where a card culls it.
+        if host.software() {
+            eprintln!("software adapter (no card): depth bounds with the depth test off not checked; skipped");
+            return;
+        }
         let Some(dxc) = dxc() else {
             eprintln!("no PC dxc.exe; skipped");
             return;
