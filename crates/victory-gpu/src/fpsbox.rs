@@ -171,7 +171,7 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
         made.clear();
     }
     let key = (tenths, format.0, scale);
-    if !made.contains_key(&key) {
+    if let std::collections::hash_map::Entry::Vacant(slot) = made.entry(key) {
         let (w, h, lit) = bitmap(&text(tenths), scale);
         let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
         let Some((buffer, data)) = host.shared_buffer((pitch * h as usize) as u64) else {
@@ -185,7 +185,7 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
                 pixel(format, lit[y * w as usize + x], &mut out[at..at + bytes]);
             }
         }
-        made.insert(key, Made { buffer, width: w, height: h, pitch: pitch as u32 });
+        slot.insert(Made { buffer, width: w, height: h, pitch: pitch as u32 });
     }
     let Some(m) = made.get(&key) else {
         return;
