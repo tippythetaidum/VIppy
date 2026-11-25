@@ -1900,3 +1900,198 @@ fn half_places_are_the_descriptors_the_program_loads() {
     runtime.push(S_ENDPGM);
     assert_eq!(lowered(&runtime).half_views, [(1, 16)]);
 }
+
+/// A format load of whole dwords (`buffer_load_format_x`, not d16) whose
+/// result the program only reads one half of as a half float
+/// (`v_cvt_f32_f16`) is moving 16-bit integers: the head program reads the
+/// face network's output so, from an `R16_UINT` view. It names its view for
+/// the host and loads the integer: 0x3c00 comes through as 1.0. Used as a
+/// whole float instead (`v_add_f32`), the load stays a float load and names
+/// nothing; so does a load of halves beside a load of the same view read as
+/// a whole float (a view of numbers the program also picks one half float
+/// out of, as hundreds of the title's pixel programs do).
+#[test]
+fn a_format_load_read_as_halves_loads_the_integer() {
+    use super::host::Stride;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT;
+    /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
+    const fn mubuf_idxen(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | 1 << 13,
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+    const LOAD_FORMAT_X: u32 = 0x00;
+    const V_CVT_F32_F16: u16 = 0x0B;
+    const V_ADD_F32: u8 = 0x03;
+    let lowered = |body: &[u32]| {
+        let view = |kind: ResourceType, table_offset_dwords: u32, stride: u32| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: table_offset_dwords / 8,
+            stride,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let mut second = s_load_dwordx4(12, 4);
+        second[1] |= 0x20;
+        let mut words = vec![s_mov_b32(5, 0x80)];
+        words.extend_from_slice(&s_load_dwordx4(8, 4));
+        words.extend_from_slice(&second);
+        // `body` leaves v2, stored raw.
+        words.extend_from_slice(body);
+        words.extend_from_slice(&buffer_store_dword(2, 12, 0));
+        words.push(S_ENDPGM);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![view(ResourceType::Srv, 0, 4), view(ResourceType::Uav, 8, 0)],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res =
+            resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let l = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        HostShader {
+            stage: HwStage::Cs,
+            dxil: l.dxil,
+            user_data: l.user_data,
+            samplers: l.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: res.root_indexed_views,
+            half_views: l.half_views,
+        }
+    };
+    // v1 = first[v0] (one channel).
+    let load = mubuf_idxen(LOAD_FORMAT_X, 1, 0, 8);
+    let half = vop1(V_CVT_F32_F16, 2, vgpr(1));
+    let as_halves = lowered(&[&load[..], &[half]].concat());
+    assert_eq!(as_halves.half_views, [(1, 0)]);
+    let as_float = lowered(&[&load[..], &[vop2(V_ADD_F32, 2, vgpr(1), 1)]].concat());
+    assert!(as_float.half_views.is_empty());
+    // v3 = first[v0] too, read as a whole float: v2 = half(v1) + v3.
+    let mut beside = load.to_vec();
+    beside.extend_from_slice(&mubuf_idxen(LOAD_FORMAT_X, 3, 0, 8));
+    beside.push(half);
+    beside.push(vop2(V_ADD_F32, 2, vgpr(3), 2));
+    assert!(lowered(&beside).half_views.is_empty());
+    // Behind a branch, as the head program has it: where the lanes meet
+    // again the loaded value goes on through a phi, and a later write of
+    // v1 under EXEC reads it only to keep it in the lanes it leaves alone.
+    const SAVE_EXEC: u32 = 0xBE90_037E; // s_mov_b32 s16, exec_lo
+    const ONLY_LANE_0: u32 = 0x7DA4_0080; // v_cmpx_eq_u32 exec_lo, 0, v0
+    const SKIP_3: u32 = 0xBF88_0003; // s_cbranch_execz over the next 3 words
+    const RESTORE_EXEC: u32 = 0xBEFE_0310; // s_mov_b32 exec_lo, s16
+    let zero = vop1(0x01, 2, 128); // v_mov_b32 v2, 0
+    let rewrite = vop1(0x01, 1, 128); // v_mov_b32 v1, 0
+    let branched = lowered(
+        &[
+            &[zero, SAVE_EXEC, ONLY_LANE_0, SKIP_3][..],
+            &load,
+            &[
+                half,
+                RESTORE_EXEC,
+                SAVE_EXEC,
+                ONLY_LANE_0,
+                rewrite,
+                RESTORE_EXEC,
+            ],
+        ]
+        .concat(),
+    );
+    assert_eq!(branched.half_views, [(1, 0)]);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for shader in [&as_halves, &branched] {
+            let mut dxil = shader.dxil.clone();
+            v.validate(&mut dxil).expect("DXIL validation failed");
+        }
+    }
+    // Element 0 of an R16_UINT buffer holds the half 1.0 (0x3c00).
+    let data = [0x0000_3c00u32, 0];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (name, shader) in [("straight", &as_halves), ("branched", &branched)] {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[
+                            View::Buffer {
+                                data: &data,
+                                stride: Stride::Format(DXGI_FORMAT_R16_UINT, 2),
+                            },
+                            View::RawUav(1),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(
+                out[0][0],
+                1.0f32.to_bits(),
+                "{label}, {name}: the half read as an integer's bits"
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
