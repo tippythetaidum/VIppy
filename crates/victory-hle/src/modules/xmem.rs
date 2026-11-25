@@ -32,6 +32,10 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 
+/// `VirtualFree`'s flag that joins adjacent placeholders into one (not in
+/// windows-sys' memory module).
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
+
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -745,12 +749,12 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let at = from + k;
-        let Some(slice) = physical
+    if from == 0 {
+        return true;
+    }
+    // The slice `from + k` shows.
+    let slice_at = |physical: &Physical, at: usize| {
+        physical
             .views
             .range(..=at)
             .next_back()
@@ -759,12 +763,53 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
                 index: s.index + (at - base) / PAGE,
                 section: s.section.clone(),
             })
-        else {
+    };
+    // One view per run of consecutive slices of one section, as
+    // `XMemMapPhysicalPages` maps: page by page was three host calls a
+    // page under the remapping lock, which texture reads wait on while the
+    // world streams in (up to 2 s of a frame's texture refreshes on the
+    // RTX 5070 test machine, runs r03 and r04).
+    // Where the two ranges overlap, a page looked up may be one just mapped:
+    // page by page then, as before.
+    let overlap = from < to + len && to < from + len;
+    let pages = len.div_ceil(PAGE);
+    let mut i = 0;
+    while i < pages {
+        let Some(first) = slice_at(&physical, from + i * PAGE) else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
-            return false;
+        let mut run = 1;
+        while !overlap
+            && i + run < pages
+            && slice_at(&physical, from + (i + run) * PAGE)
+                .is_some_and(|s| Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + run)
+        {
+            run += 1;
         }
+        let at = to + i * PAGE;
+        if run > 1 {
+            // `unmap` leaves a placeholder per view it took away (a page each
+            // here): made one, or the run is mapped page by page below.
+            // SAFETY: acts only on placeholders; fails harmlessly unless
+            // `[at, at + run pages)` is exactly whole adjacent placeholders.
+            unsafe {
+                VirtualFree(at as *mut c_void, run * PAGE, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+            }
+            if map_quiet(&mut physical, at, run * PAGE, first.clone()) {
+                i += run;
+                continue;
+            }
+        }
+        for k in 0..run {
+            let slice = Slice {
+                index: first.index + k,
+                section: first.section.clone(),
+            };
+            if !map(&mut physical, at + k * PAGE, PAGE, slice) {
+                return false;
+            }
+        }
+        i += run;
     }
     true
 }
@@ -772,6 +817,16 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    map_logged(physical, base, len, slice, true)
+}
+
+/// [`map`] without the warning when the host refuses (a caller with
+/// another way to map).
+fn map_quiet(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    map_logged(physical, base, len, slice, false)
+}
+
+fn map_logged(physical: &mut Physical, base: usize, len: usize, slice: Slice, log: bool) -> bool {
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -794,6 +849,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         )
     };
     if view.Value as usize != base {
+        if !log {
+            return false;
+        }
         tracing::warn!(
             address = format_args!("{base:#x}"),
             len,
@@ -1224,6 +1282,49 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// The GPU's page-mapping copy over a range that holds a view per page
+    /// (how it leaves one): the pages are mapped as one view, and every
+    /// address shows the page it should.
+    #[test]
+    fn a_page_mapping_copy_maps_a_run_as_one_view() {
+        const N: usize = 4;
+        let mut pages = [0usize; N];
+        let mut n = N;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), N * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, N, pages.as_ptr()), a);
+        for k in 0..N {
+            // SAFETY: mapped read-write.
+            unsafe { at(a, k).cast::<u8>().add(3).write(10 + k as u8) };
+            // A view per page at `b`, in reverse order of the pages.
+            assert!(map_alias(at(b, k) as u64, at(a, N - 1 - k) as u64, PAGE as u64));
+        }
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { b.cast::<u8>().add(3).read() }, 10 + (N - 1) as u8);
+        assert!(map_alias(b as u64, a as u64, (N * PAGE) as u64));
+        {
+            let physical = physical();
+            let (len, _) = physical.views.get(&(b as usize)).expect("a view at b");
+            assert_eq!(*len, N * PAGE, "one view for the run");
+            assert!(physical.views.range(b as usize + 1..b as usize + N * PAGE).next().is_none());
+        }
+        for k in 0..N {
+            // SAFETY: mapped read-write.
+            assert_eq!(unsafe { at(b, k).cast::<u8>().add(3).read() }, 10 + k as u8);
+        }
+        // Unmapping one page in the middle of the run keeps the others.
+        assert!(map_alias(at(b, 1) as u64, 0, PAGE as u64));
+        assert_eq!(query(at(b, 1)).host.State, MEM_RESERVE);
+        // SAFETY: still mapped.
+        assert_eq!(unsafe { at(b, 2).cast::<u8>().add(3).read() }, 12);
+        assert!(map_alias(b as u64, 0, (N * PAGE) as u64));
+        assert!(map_alias(a as u64, 0, (N * PAGE) as u64));
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
     }
 
     /// A thread that reads a mapped page in place, as the GPU side reads a
