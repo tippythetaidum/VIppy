@@ -1155,6 +1155,10 @@ struct Hosted {
     /// When the host copy was last asked for (`crate::host::moment`),
     /// written under `made`'s lock.
     used: std::sync::atomic::AtomicU64,
+    /// When a sweep first found the host copy held by nothing but this
+    /// (`crate::host::moment`); 0 while a slot or a list holds it
+    /// ([`unheld_long_enough`]).
+    unheld: std::sync::atomic::AtomicU64,
     /// The host refused to make it: not tried again.
     refused: std::sync::atomic::AtomicBool,
     /// Its host copy was let go as idle once.
@@ -1760,7 +1764,8 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// - only the host copy holds the host texture: no descriptor slot views
 ///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
 ///   read it through a slot made earlier, by a table or by an index;
-/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames, and
+///   nothing held it for as long ([`unheld_long_enough`]).
 ///
 /// The next use makes the host copy anew and uploads the title's memory
 /// again (its staging state goes with it). The title resource stays: its
@@ -1794,9 +1799,8 @@ pub(crate) fn let_go_idle() {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
+                let unheld = std::sync::Arc::strong_count(host) == 1 && crate::host::references(&host.texture) == 1;
+                unheld_long_enough(&r.host.unheld, unheld, r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
             });
             if idle {
                 // Under the lock: the next use must not find the staging
@@ -1828,6 +1832,31 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Whether [`let_go_idle`] may let a host copy go: nothing asked for it
+/// (`used`) and nothing held it (`unheld`: whether only its title texture
+/// holds it now) for `ms` and `frames`. `clock` is the copy's
+/// [`Hosted::unheld`]: set to now by the first sweep that finds the copy
+/// unheld, back to 0 by one that finds it held. A slot that viewed the copy
+/// keeps it without asking for it, so `used` alone is the moment it was
+/// made or last refreshed, often minutes before the title moved it to
+/// another slot; let go at the next sweep, the copy was made and uploaded
+/// again a frame later (a black flash: 19,054 made again of 75,053 let go
+/// in a 600 s run). The clock measures from the moment it was last held.
+#[cfg(windows)]
+fn unheld_long_enough(clock: &std::sync::atomic::AtomicU64, unheld: bool, used: u64, ms: u64, frames: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !unheld {
+        clock.store(0, Relaxed);
+        return false;
+    }
+    let since = clock.load(Relaxed);
+    if since == 0 {
+        clock.store(crate::host::moment().max(1), Relaxed);
+        return false;
+    }
+    crate::host::long_ago(used, ms, frames) && crate::host::long_ago(since, ms, frames)
 }
 
 /// For the memory line: the host copies the sweep never lets go
@@ -2308,6 +2337,7 @@ fn hand_out_resource(
             // then color or depth and stencil: 5 words) or null.
             clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
             used: std::sync::atomic::AtomicU64::new(0),
+            unheld: std::sync::atomic::AtomicU64::new(0),
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
@@ -2877,6 +2907,31 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A copy a slot let go of is not let go at once although nothing asked
+    /// for it in a long time: the first sweep that finds it unheld starts
+    /// its clock, one that finds it held again stops it, and only a clock
+    /// older than the idle time lets it go.
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_goes_only_after_it_was_unheld_for_the_idle_time() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let clock = AtomicU64::new(0);
+        // Asked for long ago (moment 0), held by a slot: stays, no clock.
+        assert!(!unheld_long_enough(&clock, false, 0, 0, 0));
+        assert_eq!(clock.load(Relaxed), 0);
+        // The slot let go of it: the first sweep starts the clock and keeps it.
+        assert!(!unheld_long_enough(&clock, true, 0, 0, 0));
+        assert_ne!(clock.load(Relaxed), 0);
+        // Held again before the next sweep: the clock stops.
+        assert!(!unheld_long_enough(&clock, false, 0, 0, 0));
+        assert_eq!(clock.load(Relaxed), 0);
+        // Unheld for a while: with an idle time of a minute it stays...
+        assert!(!unheld_long_enough(&clock, true, 0, 60_000, 0));
+        assert!(!unheld_long_enough(&clock, true, 0, 60_000, 0));
+        // ...and with none it goes.
+        assert!(unheld_long_enough(&clock, true, 0, 0, 0));
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
