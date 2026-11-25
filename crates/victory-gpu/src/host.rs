@@ -120,23 +120,34 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
+/// `VICTORY_TEXTURE_IDLE_MS` sets the time below 75 % of the budget (5,000
+/// unless said); the two steps above it are a half and a fifth of it.
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
-    const NORMAL_MS: u64 = 5_000;
-    const MODERATE_MS: u64 = 2_500;
-    const HIGH_MS: u64 = 1_000;
+    static NORMAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let normal = *NORMAL.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_IDLE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(5_000)
+    });
+    vram_idle_ms_from(video_memory, normal)
+}
+
+/// [`vram_idle_ms`] for a time `normal` below 75 % of the budget.
+fn vram_idle_ms_from(video_memory: Option<[u64; 4]>, normal: u64) -> u64 {
+    let normal = normal.max(1_000);
+    let moderate = (normal / 2).max(1_000);
+    let high = (normal / 5).max(1_000);
     let Some([budget, used, ..]) = video_memory else {
-        return NORMAL_MS;
+        return normal;
     };
     if budget == 0 {
-        return NORMAL_MS;
+        return normal;
     }
     let used_pct = (u128::from(used) * 100) / u128::from(budget);
     if used_pct >= 85 {
-        HIGH_MS
+        high
     } else if used_pct >= 75 {
-        MODERATE_MS
+        moderate
     } else {
-        NORMAL_MS
+        normal
     }
 }
 
@@ -8628,6 +8639,18 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Missing or zero budget falls back to normal
         assert_eq!(vram_idle_ms(None), 5_000);
         assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+    }
+
+    #[test]
+    fn vram_idle_ms_follows_a_longer_normal_time() {
+        use super::vram_idle_ms_from;
+        assert_eq!(vram_idle_ms_from(Some([100, 74, 0, 0]), 30_000), 30_000);
+        assert_eq!(vram_idle_ms_from(Some([100, 80, 0, 0]), 30_000), 15_000);
+        assert_eq!(vram_idle_ms_from(Some([100, 90, 0, 0]), 30_000), 6_000);
+        // The default gives the times as before; none under a second.
+        assert_eq!(vram_idle_ms_from(Some([100, 80, 0, 0]), 5_000), 2_500);
+        assert_eq!(vram_idle_ms_from(Some([100, 90, 0, 0]), 5_000), 1_000);
+        assert_eq!(vram_idle_ms_from(Some([100, 90, 0, 0]), 100), 1_000);
     }
 
     #[test]
