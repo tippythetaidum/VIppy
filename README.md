@@ -17,7 +17,7 @@ Measured on one machine: RTX 5080 16 GB (driver 621.14), Ryzen 7 9800X3D (8 thre
 
 ### Known gaps
 
-- **Reflections show a bright sky indoors** (eyes, glasses, picture frames, display glass), and with #823's reflection program on, floors and walls look oily or smeared. Ray tracing doesn't run yet.
+- **Reflections show a bright sky indoors** (eyes, glasses, picture frames, display glass). Ray tracing doesn't run yet. With #823's screen-space reflection tiling on, floors and walls look oily and smeared, so the settings below leave that one program off; close characters then look flatter in places.
 - **Moving characters smear** and leave a short trail at these frame rates (the title's temporal upscaler).
 - **Black textures and short black flickers** when the card is near its memory budget: past 90 % no new texture copies are made, and idle copies are let go and made again ([victory-fork#1080](https://github.com/fxceless/victory-fork/issues/1080)).
 - Bright sun shafts can blow out characters in the bank scene.
@@ -69,12 +69,15 @@ $env:VICTORY_BACK_OWN_VIEW = '1';   $env:VICTORY_INDIRECT_GATHER = '1'; $env:VIC
 $env:VICTORY_ASYNC_SUBMIT = '1';    $env:VICTORY_QUEUE2 = '1';     $env:VICTORY_TEXTURE_NO_WAIT = '1'
 $env:VICTORY_HEAP_WORKER = '1';     $env:VICTORY_LEVELS_ON_DEMAND = '1'; $env:VICTORY_AMBIENT = '0.3'
 $env:VICTORY_TEXTURE_STAGE_MB = '4096'; $env:VICTORY_TEXTURE_STAGE_MS = '8000'   # finish due textures before the frame
+$env:VICTORY_WAVE_WIDE_ONLY = '5dc3b25986622949,6f225b641c5b0708,369cbe906ea72764'   # #823 without the reflection tiling: no oily floors
 target\release\victory.exe run "<game folder>\<the title's exe>" --execute
 ```
 
 The first launch translates the title's shaders into a cache and is slow; let it run once into the world. Later launches start quickly.
 
-- **Faster, with a trade-off:** `$env:VICTORY_WAVE_WIDE_ONLY = 'none'` turns #823's four programs off. That's about 30 % more frames per second, natural eyes and no sky in floor reflections, but close characters lose their reflected light. It uses its own shader cache.
+- **Reflection tiling back on:** leave `VICTORY_WAVE_WIDE_ONLY` unset for all four of #823's programs. Close characters keep their reflected light, but floors and walls turn oily (the reflection rays find no ray-tracing structures and return the sky).
+- **Faster, with a trade-off:** `$env:VICTORY_WAVE_WIDE_ONLY = 'none'` turns all four off. That's about 30 % more frames per second, but the water and particle programs are dropped as well.
+- These apply to NVIDIA and other 32-lane cards: on 64-lane cards (AMD) the four programs run in their own form and the switch has no effect. Each value has its own shader cache.
 - **Input:** XInput pads. Without one, the keyboard acts as a pad while the window has focus (WASD and IJKL for the sticks, the arrow keys for the D-pad, Enter, Backspace, X and Y for A, B, X and Y).
 - **Commands, logging and debugging aids:** see [upstream's README](docs/victory-fork-README.md#commands).
 
