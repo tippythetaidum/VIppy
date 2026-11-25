@@ -174,6 +174,56 @@ impl GraphicsState {
         }
     }
 
+    /// Blending off for render targets of an integer format, which D3D12 cannot blend (the
+    /// pipeline is refused with `E_INVALIDARG`, debug layer message 676); the console's
+    /// hardware leaves such a target unblended. With one blend state for all targets
+    /// (`IndependentBlendEnable` off) it is copied to each first, so the others keep it.
+    pub(crate) fn integer_targets_unblended(&mut self) {
+        let integer = |f: DXGI_FORMAT| {
+            matches!(
+                f,
+                DXGI_FORMAT_R32G32B32A32_UINT
+                    | DXGI_FORMAT_R32G32B32A32_SINT
+                    | DXGI_FORMAT_R32G32B32_UINT
+                    | DXGI_FORMAT_R32G32B32_SINT
+                    | DXGI_FORMAT_R16G16B16A16_UINT
+                    | DXGI_FORMAT_R16G16B16A16_SINT
+                    | DXGI_FORMAT_R32G32_UINT
+                    | DXGI_FORMAT_R32G32_SINT
+                    | DXGI_FORMAT_R10G10B10A2_UINT
+                    | DXGI_FORMAT_R8G8B8A8_UINT
+                    | DXGI_FORMAT_R8G8B8A8_SINT
+                    | DXGI_FORMAT_R16G16_UINT
+                    | DXGI_FORMAT_R16G16_SINT
+                    | DXGI_FORMAT_R32_UINT
+                    | DXGI_FORMAT_R32_SINT
+                    | DXGI_FORMAT_R8G8_UINT
+                    | DXGI_FORMAT_R8G8_SINT
+                    | DXGI_FORMAT_R16_UINT
+                    | DXGI_FORMAT_R16_SINT
+                    | DXGI_FORMAT_R8_UINT
+                    | DXGI_FORMAT_R8_SINT
+            )
+        };
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let blended = |s: &Self, i: usize| {
+            let t = if s.blend.IndependentBlendEnable.as_bool() { i } else { 0 };
+            s.blend.RenderTarget[t].BlendEnable.as_bool()
+        };
+        let fix: Vec<usize> = (0..count).filter(|&i| integer(self.targets.RTFormats[i]) && blended(self, i)).collect();
+        if fix.is_empty() {
+            return;
+        }
+        if !self.blend.IndependentBlendEnable.as_bool() {
+            let first = self.blend.RenderTarget[0];
+            self.blend.RenderTarget = [first; 8];
+            self.blend.IndependentBlendEnable = true.into();
+        }
+        for i in fix {
+            self.blend.RenderTarget[i].BlendEnable = false.into();
+        }
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
