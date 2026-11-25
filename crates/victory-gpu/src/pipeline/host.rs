@@ -1083,6 +1083,7 @@ mod tests {
         }
         // WARP reports the depth bounds test but lets the draw through with
         // the depth test itself off (as below), where a card culls it.
+        eprintln!("host adapter: {:?}", host.adapter_desc());
         if host.software() {
             eprintln!("software adapter (no card): depth bounds with the depth test off not checked; skipped");
             return;

@@ -3760,15 +3760,24 @@ impl Host {
         })
     }
 
-    /// Whether the host device is the software adapter (WARP), as on a
+    /// The host adapter's name, PCI vendor and DXGI flags, for tests that
+    /// tell a card from Microsoft's software adapters.
+    #[cfg(test)]
+    pub(crate) fn adapter_desc(&self) -> Option<(String, u32, u32)> {
+        // SAFETY: a plain query.
+        let d = unsafe { self.adapter.as_ref()?.GetDesc1() }.ok()?;
+        let len = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+        Some((String::from_utf16_lossy(&d.Description[..len]), d.VendorId, d.Flags))
+    }
+
+    /// Whether the host device is one of Microsoft's software adapters
+    /// (WARP or the Basic Render Driver, PCI vendor 0x1414), as on a
     /// machine without a card (continuous integration).
     #[cfg(test)]
     pub(crate) fn software(&self) -> bool {
-        // SAFETY: a plain query.
-        self.adapter
-            .as_ref()
-            .and_then(|a| unsafe { a.GetDesc1() }.ok())
-            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+        self.adapter_desc().is_some_and(|(_, vendor, flags)| {
+            vendor == 0x1414 || flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+        })
     }
 
     /// Whether the host GPU supports the depth bounds test; logged once.
