@@ -757,6 +757,8 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
+    #[cfg(windows)]
+    graphics.integer_targets_unblended();
     hand_out(
         shaders,
         #[cfg(windows)]
