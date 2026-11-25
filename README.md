@@ -11,7 +11,7 @@
 | **Progress** | Boots into the world and plays: the prison opening, the cell, corridors and common room, the counselor's office, Lucia's café flashback and the bank robbery in it. |
 | **Frame rate** | Median 5.7 fps in the world with the settings below (peaks 8.3); median 7.4 fps (peaks 10.3) with #823's programs off. RTX 5080, Ryzen 7 9800X3D. |
 | **Picture** | Textures in place (levels on demand), rooms lit (an ambient constant while ray tracing doesn't run), mouths move in dialogue. |
-| **Stability** | No crash and no device loss in RUNCOUNT ten-minute runs on 25 November. |
+| **Stability** | No crash and no device loss in nine ten-minute runs on 25 November (this build and the builds leading up to it). |
 
 Measured on one machine: RTX 5080 16 GB (driver 621.14), Ryzen 7 9800X3D (8 threads), Windows 11, Series X profile, release build. Test reports from other hardware are very welcome ([how](CONTRIBUTING.md#test-reports)).
 
