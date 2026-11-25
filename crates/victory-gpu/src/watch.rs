@@ -856,6 +856,57 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             g.viewed.extend(from..to);
         }
     };
+    // Only view memory is made read-only. A range can run past the views
+    // into other committed memory: with the structure builder on, the
+    // 4 MiB 0x400000-0x800000 (a window that begins in mapped memory, so
+    // `is_view` says yes) had every committed private block in it made
+    // read-only block by block below, the process heap's among them. The
+    // heap's own code then faulted while holding its lock, the faults
+    // waited for the guard lock, and the world froze. Committed private
+    // memory and images are never guarded (as Marvisak/VIctory's 280b150
+    // decides region by region).
+    let mut at = from;
+    while at < to {
+        let (end, view) = view_run(at, to);
+        if view {
+            protect_run(g, at, end, &set, &note);
+        } else {
+            for block in at..end {
+                not_guarded(g, block);
+            }
+        }
+        at = end;
+    }
+}
+
+/// From `block` on (to `to` at most): the end of the run of blocks whose
+/// memory is of one kind, and whether that kind may be guarded (anything
+/// but committed private memory and images: views, and placeholders,
+/// which [`not_guarded`] notes absent when a protection fails).
+fn view_run(block: usize, to: usize) -> (usize, bool) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 {
+        return (block + 1, false);
+    }
+    let end = ((info.BaseAddress as usize).saturating_add(info.RegionSize).div_ceil(BLOCK)).clamp(block + 1, to);
+    let other = info.State == MEM_COMMIT && (info.Type == MEM_PRIVATE || info.Type == MEM_IMAGE);
+    (end, !other)
+}
+
+/// [`protect_here`] for a run of view blocks: whole, else block by block.
+fn protect_run(
+    g: &mut Guards,
+    from: usize,
+    to: usize,
+    set: &dyn Fn(usize, usize) -> bool,
+    note: &dyn Fn(&mut Guards, usize, usize),
+) {
     if set(from, to) {
         note(g, from, to);
         return;
@@ -864,21 +915,27 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         if set(block, block + 1) {
             note(g, block, block + 1);
         } else {
-            #[cfg(feature = "diagnostics")]
-            let error = std::io::Error::last_os_error();
-            if block < uncommitted_end(block) {
-                g.absent.insert(block);
-            } else {
-                // Diagnostics: a committed block that will not be made
-                // read-only is reported written at every asking and never
-                // known to the guards (one in 1,024 said).
-                #[cfg(feature = "diagnostics")]
-                {
-                    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(1024) {
-                        tracing::info!("a block of title memory could not be made read-only (one in 1024): {:#x}: {error}", block * BLOCK);
-                    }
-                }
+            not_guarded(g, block);
+        }
+    }
+}
+
+/// A block of a range to guard that was not made read-only: noted absent
+/// where nothing is committed (a placeholder the runtime maps later).
+fn not_guarded(g: &mut Guards, block: usize) {
+    #[cfg(feature = "diagnostics")]
+    let error = std::io::Error::last_os_error();
+    if block < uncommitted_end(block) {
+        g.absent.insert(block);
+    } else {
+        // Diagnostics: a committed block that will not be made read-only
+        // is reported written at every asking and never known to the
+        // guards (one in 1,024 said).
+        #[cfg(feature = "diagnostics")]
+        {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(1024) {
+                tracing::info!("a block of title memory could not be made read-only (one in 1024): {:#x}: {error}", block * BLOCK);
             }
         }
     }
@@ -1281,6 +1338,83 @@ mod tests {
                 && info.BaseAddress as usize + info.RegionSize >= r + 2 * PAGE
         };
         assert!(!(tracked && still_free), "free memory");
+    }
+
+    /// A range that begins in a view and runs into committed private
+    /// memory guards the view only: the private block (the process heap's,
+    /// say) stays writable.
+    #[test]
+    fn committed_private_memory_beside_a_view_is_not_guarded() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MapViewOfFile3, PAGE_NOACCESS,
+            UnmapViewOfFile2, VirtualAlloc2, VirtualQuery,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a fresh placeholder of two blocks, split; a pagefile
+        // section's block mapped over the first, private memory committed
+        // over the second.
+        let (p, section, view) = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                2 * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            assert_ne!(VirtualFree(p as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), 0);
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                p as *const _,
+                0,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_eq!(view.Value as usize, p);
+            let private = VirtualAlloc2(
+                GetCurrentProcess(),
+                (p + BLOCK) as *const _,
+                BLOCK,
+                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_eq!(private, p + BLOCK);
+            (p, section, view)
+        };
+        title_memory_remapped(p, BLOCK);
+        assert!(is_view(p, p + 2 * BLOCK), "it begins in a view");
+        assert!(guard(p, p + 2 * BLOCK).is_some());
+        let protection = |at: usize| {
+            // SAFETY: plain data filled in by the query, of the right size.
+            unsafe {
+                let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                assert_ne!(VirtualQuery(at as *const _, &mut info, size_of_val(&info)), 0);
+                info.Protect
+            }
+        };
+        assert_eq!(protection(p), windows_sys::Win32::System::Memory::PAGE_READONLY, "the view is guarded");
+        assert_eq!(protection(p + BLOCK), PAGE_READWRITE, "the private block is not");
+        // SAFETY: committed private memory of ours, writable.
+        unsafe { ((p + BLOCK + 8) as *mut u8).write_volatile(1) };
+        title_memory_remapped(p, 2 * BLOCK);
+        // SAFETY: our view, section and private block.
+        unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), view, 0);
+            VirtualFree((p + BLOCK) as *mut _, 0, MEM_RELEASE);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
