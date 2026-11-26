@@ -8,7 +8,7 @@
 
 | | |
 |---|---|
-| **Progress** | Boots into the world and plays: the prison opening, the cell, corridors and common room, the counselor's office, Lucia's café flashback and the bank robbery in it. |
+| **Progress** | Boots into the world and plays: the prison opening, the cell, corridors and common room, the counselor's office, Lucia's café flashback and the bank robbery in it, and on into Chapter 1 (the boat) with the newer build on branch [`integration-1125`](https://github.com/tippythetaidum/VIppy/tree/integration-1125): victory-fork `main` `d827419` plus the pull requests here. That branch, run with the settings below, gave the cleanest picture so far on 25 November; it isn't merged into this branch yet. |
 | **Frame rate** | Median 5.7 fps in the world with the settings below (peaks 8.3); median 7.4 fps (peaks 10.3) with #823's programs off. RTX 5080, Ryzen 7 9800X3D. |
 | **Picture** | Textures in place (levels on demand), rooms lit (an ambient constant while ray tracing doesn't run) at about the console's brightness (at `VICTORY_AMBIENT=0.3`, mean luma within 2-4 of 255 of Series X footage in three matched shots, measured in a test build of this tree with the ray-tracing pull requests merged), mouths move in dialogue. |
 | **Stability** | No crash and no device loss in nine ten-minute runs on 25 November (this build and the builds leading up to it). A freeze with the ray-tracing structure builder on (`VICTORY_BVH_BUILDER=1`, not in this build's settings) is fixed here: the write guards no longer make the process heap read-only. |
